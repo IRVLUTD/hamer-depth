@@ -9,6 +9,7 @@ setup(
         'gdown',
         'numpy',
         'opencv-python',
+        'pyopengl',
         'pyrender',
         'pytorch-lightning',
         'scikit-image',
@@ -23,6 +24,7 @@ setup(
         'einops',
         'xtcocotools',
         'pandas',
+        'scikit-learn',
     ],
     extras_require={
         'all': [
