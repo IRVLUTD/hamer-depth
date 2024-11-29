@@ -43,7 +43,8 @@ def obj_funcion(x, vertices, translation, K1, K2, kd_tree):
 
     # error
     error_2d = np.square(x1[:2] - x2[:2]).mean()
-    return error_2d + 10 * error_3d
+    print('error 2d', error_2d, 'error_3d', error_3d)
+    return error_2d + 100 * error_3d
     
 
 
@@ -247,7 +248,11 @@ def main():
             cv2.imwrite(os.path.join(args.out_folder, f'{img_fn}_all.jpg'), 255*input_img_overlay[:, :, ::-1])
 
             # get the hand points
-            mask = 1 - cam_view[:,:,3] > 0
+            mask = cam_view[:,:,3] > 0
+            # eroder mask
+            kernel = np.ones((5, 5), np.uint8) 
+            mask = cv2.erode(mask.astype(np.uint8), kernel)
+            mask = 1 - mask 
             # convert depth to point cloud
             depth_pc = DepthPointCloud(depth, intrinsic_matrix, camera_pose=np.eye(4), target_mask=mask, threshold=10.0)
             print(depth_pc.points.shape)
@@ -262,7 +267,10 @@ def main():
             print(res.x)          
 
             fig = plt.figure()
-            ax = fig.add_subplot(1, 3, 1)
+            ax = fig.add_subplot(2, 2, 1)
+            plt.imshow(input_img)
+
+            ax = fig.add_subplot(2, 2, 2)
             plt.imshow(input_img)
             # verify projection 1
             vertices = all_verts[-1] + all_cam_t[-1]
@@ -274,7 +282,7 @@ def main():
             plt.plot(x2d[0, :], x2d[1, :])
             plt.title('projection using hamer camera')
 
-            ax = fig.add_subplot(1, 3, 2)
+            ax = fig.add_subplot(2, 2, 3)
             plt.imshow(input_img)
             # verify projection 2
             vertices = all_verts[-1] + translation_new
@@ -284,9 +292,9 @@ def main():
             plt.plot(x2d[0, :], x2d[1, :])              
             plt.title('projection using fetch camera')
 
-            ax = fig.add_subplot(1, 3, 3, projection='3d')
-            depth_pc = DepthPointCloud(depth, intrinsic_matrix, camera_pose=np.eye(4), target_mask=None, threshold=10.0)
-            ax.scatter(depth_pc.points[::100, 0], depth_pc.points[::100, 1], depth_pc.points[::100, 2], marker='o')
+            ax = fig.add_subplot(2, 2, 4, projection='3d')
+            # depth_pc = DepthPointCloud(depth, intrinsic_matrix, camera_pose=np.eye(4), target_mask=None, threshold=10.0)
+            ax.scatter(depth_pc.points[:, 0], depth_pc.points[:, 1], depth_pc.points[:, 2], marker='o')
             ax.scatter(vertices[:, 0], vertices[:, 1], vertices[:, 2], marker='o', color='r')
 
             ax.set_xlabel('X Label')
