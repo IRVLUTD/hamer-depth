@@ -4,6 +4,7 @@ import argparse
 import os
 import cv2
 import numpy as np
+import open3d as o3d
 from scipy.optimize import minimize
 from mesh_to_sdf.depth_point_cloud import DepthPointCloud
 
@@ -21,6 +22,29 @@ from vitpose_model import ViTPoseModel
 import json
 from typing import Dict, Optional
 import matplotlib.pyplot as plt
+
+def save_point_cloud_as_ply(vertices, filename, colors=None):
+    """
+    Save a point cloud (with optional RGB colors) as a PLY file using Open3D.
+    Args:
+        vertices (numpy.ndarray): Nx3 array of 3D points.
+        filename (str): Name of the output PLY file (without extension).
+        colors (numpy.ndarray, optional): Nx3 array of RGB colors (values in range [0, 255]).
+                                            If None, saves the point cloud without colors.        
+    """
+    # Create an Open3D PointCloud object
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(vertices)
+
+    # Add colors if provided
+    if colors is not None:
+        if colors.shape[0] != vertices.shape[0]:
+            raise ValueError("The number of color entries must match the number of vertices.")
+        pcd.colors = o3d.utility.Vector3dVector(colors / 255.0)  # Normalize RGB to [0, 1]    
+
+    # Save the point cloud to a PLY file
+    o3d.io.write_point_cloud(filename, pcd)
+    print(f"Point cloud saved to '{filename}' using Open3D.")
 
 
 def obj_funcion(x, vertices, translation, K1, K2, kd_tree):
@@ -293,14 +317,23 @@ def main():
             plt.title('projection using fetch camera')
 
             ax = fig.add_subplot(2, 2, 4, projection='3d')
-            # depth_pc = DepthPointCloud(depth, intrinsic_matrix, camera_pose=np.eye(4), target_mask=None, threshold=10.0)
             ax.scatter(depth_pc.points[:, 0], depth_pc.points[:, 1], depth_pc.points[:, 2], marker='o')
             ax.scatter(vertices[:, 0], vertices[:, 1], vertices[:, 2], marker='o', color='r')
 
             ax.set_xlabel('X Label')
             ax.set_ylabel('Y Label')
             ax.set_zlabel('Z Label')
-            plt.show()               
+
+            # save file
+            depth_pc = DepthPointCloud(depth, intrinsic_matrix, camera_pose=np.eye(4), target_mask=None, threshold=10.0)
+            colors = np.zeros(depth_pc.points.shape)
+            colors[:, 1] = 255
+            save_point_cloud_as_ply(depth_pc.points, filename='depth.ply', colors=colors)
+            colors = np.zeros(vertices.shape)
+            colors[:, 0] = 255
+            save_point_cloud_as_ply(vertices, filename='hand.ply', colors=colors)
+
+            plt.show()
 
 if __name__ == '__main__':
     main()

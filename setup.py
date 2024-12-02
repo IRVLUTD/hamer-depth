@@ -11,6 +11,7 @@ setup(
         'opencv-python',
         'pyopengl',
         'pyrender',
+        'open3d',
         'pytorch-lightning',
         'scikit-image',
         'smplx==0.1.28',

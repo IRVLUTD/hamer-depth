@@ -5,6 +5,7 @@
 *.lock
 *.pt
 *.npy
+*.ply
 /example_data/downloaded*
 *.tar
 *.tar.gz
