@@ -278,7 +278,7 @@ def main():
             mask = cv2.erode(mask.astype(np.uint8), kernel)
             mask = 1 - mask 
             # convert depth to point cloud
-            depth_pc = DepthPointCloud(depth, intrinsic_matrix, camera_pose=np.eye(4), target_mask=mask, threshold=10.0)
+            depth_pc = DepthPointCloud(depth, intrinsic_matrix, camera_pose=np.eye(4), target_mask=mask, threshold=10.0, use_kmeans=True)
             print(depth_pc.points.shape)
 
             # solve new translation

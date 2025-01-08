@@ -1,5 +1,6 @@
 import numpy as np
 from sklearn.neighbors import KDTree
+from sklearn.cluster import KMeans
 import math
 import pyrender
 import time
@@ -7,7 +8,7 @@ import time
 
 
 class DepthPointCloud:
-    def __init__(self, depth, intrinsic_matrix, camera_pose, target_mask=None, threshold=1.5):
+    def __init__(self, depth, intrinsic_matrix, camera_pose, target_mask=None, threshold=1.5, use_kmeans=False):
         self.depth = depth
         self.intrinsic_matrix = intrinsic_matrix
         self.camera_pose = camera_pose
@@ -18,6 +19,17 @@ class DepthPointCloud:
 
         # backproject to camera
         pc = self.backproject_camera(depth, intrinsic_matrix)
+
+        # kmean to keep the big cluster
+        if use_kmeans:
+            kmeans = KMeans(n_clusters=2, random_state=0, n_init="auto").fit(pc.T)
+            labels = kmeans.labels_
+            n0 = np.sum(labels == 0)
+            n1 = np.sum(labels == 1)
+            if n0 > n1:
+                pc = pc[:, labels == 0]
+            else:
+                pc = pc[:, labels == 1]
 
         # transform points to world
         pc_base = camera_pose[:3, :3] @ pc + camera_pose[:3, 3].reshape((3, 1))
