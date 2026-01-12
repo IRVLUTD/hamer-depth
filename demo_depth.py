@@ -14,8 +14,8 @@ from hamer.utils import recursive_to
 from hamer.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
 from hamer.utils.renderer import Renderer, cam_crop_to_full
 
-
 LIGHT_BLUE=(0.65098039,  0.74117647,  0.85882353)
+os.environ["PYOPENGL_PLATFORM"] = "win32"
 
 from vitpose_model import ViTPoseModel
 
@@ -47,6 +47,95 @@ def save_point_cloud_as_ply(vertices, filename, colors=None):
     print(f"Point cloud saved to '{filename}' using Open3D.")
 
 
+def project_point(K, p_cam):
+    """
+    K: (3,3)
+    p_cam: (3,) in camera coordinates (X,Y,Z)
+    returns: (u,v), valid (bool)
+    """
+    X, Y, Z = float(p_cam[0]), float(p_cam[1]), float(p_cam[2])
+    if Z <= 1e-6:
+        return (np.nan, np.nan), False
+    u = K[0, 0] * (X / Z) + K[0, 2]
+    v = K[1, 1] * (Y / Z) + K[1, 2]
+    return (u, v), True
+
+
+def radius_px_from_metric(fx, z_m, r_m, r_min=8, r_max=80):
+    if z_m <= 1e-6:
+        return r_min
+    r_px = fx * (r_m / z_m)
+    return int(np.clip(r_px, r_min, r_max))
+
+
+def project_uvz(K, P_cam):
+    X, Y, Z = P_cam[:, 0], P_cam[:, 1], P_cam[:, 2]
+    u = K[0,0] * (X / (Z + 1e-8)) + K[0,2]
+    v = K[1,1] * (Y / (Z + 1e-8)) + K[1,2]
+    return u, v, Z
+
+def depth_median_patch(depth, u, v, r=1, z_min=0.1, z_max=5.0):
+    H, W = depth.shape
+    ui, vi = int(round(u)), int(round(v))
+    if ui < 0 or ui >= W or vi < 0 or vi >= H:
+        return None
+    u0, u1 = max(0, ui-r), min(W, ui+r+1)
+    v0, v1 = max(0, vi-r), min(H, vi+r+1)
+    patch = depth[v0:v1, u0:u1].astype(np.float32)
+    valid = (patch > z_min) & (patch < z_max)
+    if not np.any(valid):
+        return None
+    return float(np.median(patch[valid]))
+
+
+def visible_vertices_from_render_depth(vertices, x, K, depth_view,
+                                       z_eps=0.008,
+                                       invalid_is_zero=True):
+    """
+    vertices: (N,3) MANO vertices in model space (AFTER your right-hand x flip, if you do that)
+    x: (3,) translation in camera frame (same frame as depth_view)
+    K: (3,3) intrinsics used for rendering/projection (must match render_res)
+    depth_view: (H,W) z-buffer depth from renderer for THIS pose
+    z_eps: depth tolerance in meters
+    invalid_is_zero: if True, treat depth==0 as background/invalid
+
+    returns:
+      vis: (N,) boolean array
+      uv:  (N,2) projected pixel coords (float)
+    """
+    H, W = depth_view.shape[:2]
+
+    # vertices to camera frame under hypothesis x
+    V = vertices + x.reshape(1, 3)
+
+    X, Y, Z = V[:, 0], V[:, 1], V[:, 2]
+    valid_z = Z > 1e-6
+
+    # project
+    u = K[0, 0] * (X / (Z + 1e-8)) + K[0, 2]
+    v = K[1, 1] * (Y / (Z + 1e-8)) + K[1, 2]
+    uv = np.stack([u, v], axis=1)
+
+    ui = np.round(u).astype(np.int32)
+    vi = np.round(v).astype(np.int32)
+
+    inb = valid_z & (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
+    vis = np.zeros(vertices.shape[0], dtype=bool)
+
+    idx = np.where(inb)[0]
+    zbuf = depth_view[vi[idx], ui[idx]].astype(np.float32)
+
+    if invalid_is_zero:
+        ok_depth = zbuf > 0.0
+    else:
+        ok_depth = np.isfinite(zbuf)
+
+    ok = ok_depth & (np.abs(Z[idx].astype(np.float32) - zbuf) <= float(z_eps))
+    vis[idx[ok]] = True
+
+    return vis, uv
+
+
 def obj_funcion(x, vertices, translation, K1, K2, kd_tree):
     # projection 1
     V1 = vertices + translation
@@ -63,13 +152,12 @@ def obj_funcion(x, vertices, translation, K1, K2, kd_tree):
     # 3D distances
     distances, indices = kd_tree.query(V2)
     distances = distances.astype(np.float32).reshape(-1)
-    error_3d = np.mean(distances)
+    error_3d = 100 * np.mean(distances)
 
     # error
-    error_2d = np.square(x1[:2] - x2[:2]).mean()
+    error_2d = 0.1 * np.square(x1[:2] - x2[:2]).mean()
     print('error 2d', error_2d, 'error_3d', error_3d)
-    return error_2d + 100 * error_3d
-    
+    return error_2d + error_3d
 
 
 def main():
@@ -87,8 +175,8 @@ def main():
 
     args = parser.parse_args()
 
-    intrinsic_matrix = np.array([[574.0527954101562, 0.0, 319.5],
-        [0.0, 574.0527954101562, 239.5],
+    intrinsic_matrix = np.array([[283.075, 0.0, 319.661],
+        [0.0, 283.035, 199.896],
         [0.0, 0.0, 1.0]])
     print(intrinsic_matrix)
 
@@ -135,11 +223,17 @@ def main():
     # Iterate over all images in folder
     for img_path in img_paths:
         print(img_path)
+
+        if 'left' not in str(img_path):
+            continue
+
         img_cv2 = cv2.imread(str(img_path))
+        im_width = img_cv2.shape[1]
+        im_height = img_cv2.shape[0]
 
         # load depth
-        depth_path = str(img_path).replace('jpg', 'png')
-        depth = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH).astype(np.float32)
+        depth_path = str(img_path).replace('left', 'depth')
+        depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
         depth /= 1000.0
         print(np.min(depth), np.max(depth))
 
@@ -198,6 +292,7 @@ def main():
             batch = recursive_to(batch, device)
             with torch.no_grad():
                 out = model(batch)
+            print(out.keys())                
 
             multiplier = (2*batch['right']-1)
             pred_cam = out['pred_cam']
@@ -262,7 +357,7 @@ def main():
                 focal_length=scaled_focal_length,
             )
             print('len all verts', len(all_verts))
-            cam_view = renderer.render_rgba_multiple(all_verts, cam_t=all_cam_t, render_res=img_size[n], is_right=all_right, **misc_args)
+            cam_view, _ = renderer.render_rgba_multiple(all_verts, cam_t=all_cam_t, render_res=img_size[n], is_right=all_right, **misc_args)
 
             # Overlay image
             input_img = img_cv2.astype(np.float32)[:,:,::-1]/255.0
@@ -271,69 +366,183 @@ def main():
 
             cv2.imwrite(os.path.join(args.out_folder, f'{img_fn}_all.jpg'), 255*input_img_overlay[:, :, ::-1])
 
-            # get the hand points
-            mask = cam_view[:,:,3] > 0
-            # eroder mask
-            kernel = np.ones((5, 5), np.uint8) 
-            mask = cv2.erode(mask.astype(np.uint8), kernel)
-            mask = 1 - mask 
-            # convert depth to point cloud
-            depth_pc = DepthPointCloud(depth, intrinsic_matrix, camera_pose=np.eye(4), target_mask=mask, threshold=10.0, use_kmeans=True)
-            print(depth_pc.points.shape)
+            # Optimize each hand one by one
+            optimized_cam_t = []
+            for hand_id, (verts_i, cam_t_i, right_i) in enumerate(zip(all_verts, all_cam_t, all_right)):
+                print(f"\n[opt] hand {hand_id}/{len(all_verts)-1}, right={right_i}")
 
-            # solve new translation
-            K = np.array([[12500, 0, 320], [0, 12500, 240], [0, 0, 1]]).astype(np.float32)
-            x0 = np.mean(depth_pc.points, axis=0)
-            print(x0.shape)
-            res = minimize(obj_funcion, x0, method='nelder-mead',
-                        args=(all_verts[-1], all_cam_t[-1], K, intrinsic_matrix, depth_pc.kd_tree), options={'xatol': 1e-8, 'disp': True})
-            translation_new = res.x
-            print(res.x)          
+                # Render ONLY this hand to get a per-hand mask
+                cam_view_i, depth_view_i = renderer.render_rgba_multiple(
+                    [verts_i], cam_t=[cam_t_i], render_res=img_size[n], is_right=[right_i], **misc_args
+                )
 
-            fig = plt.figure()
-            ax = fig.add_subplot(2, 2, 1)
-            plt.imshow(input_img)
+                # plt.figure()
+                # plt.imshow(depth_view_i)  # BGRA->RGBA for plt if needed; adjust if colors look off
+                # plt.title("depth_view_i")
+                # plt.axis("off")
+                # plt.show()
 
-            ax = fig.add_subplot(2, 2, 2)
-            plt.imshow(input_img)
-            # verify projection 1
-            vertices = all_verts[-1] + all_cam_t[-1]
-            print(K, vertices)
-            print(vertices.shape)
-            x2d = K @ vertices.T
-            x2d[0, :] /= x2d[2, :]
-            x2d[1, :] /= x2d[2, :]
-            plt.plot(x2d[0, :], x2d[1, :])
-            plt.title('projection using hamer camera')
+                # check wrist keypoint
+                # ---- inside your per-hand loop (hand_id / n) ----
+                # right_i is 0/1 (numpy) in your loop; convert to int
+                right_i_int = int(right_i)
+                sign = (2 * right_i_int - 1)
 
-            ax = fig.add_subplot(2, 2, 3)
-            plt.imshow(input_img)
-            # verify projection 2
-            vertices = all_verts[-1] + translation_new
-            x2d = intrinsic_matrix @ vertices.T
-            x2d[0, :] /= x2d[2, :]
-            x2d[1, :] /= x2d[2, :]
-            plt.plot(x2d[0, :], x2d[1, :])              
-            plt.title('projection using fetch camera')
+                # wrist 3D in MANO space from HaMeR keypoints
+                kpts3d = out["pred_keypoints_3d"][hand_id].detach().cpu().numpy()   # (K,3)
+                kpts3d[:, 0] *= sign                                          # match your vertex flip
+                wrist_mano = kpts3d[0]                                        # wrist keypoint (usually index 0)
 
-            ax = fig.add_subplot(2, 2, 4, projection='3d')
-            ax.scatter(depth_pc.points[:, 0], depth_pc.points[:, 1], depth_pc.points[:, 2], marker='o')
-            ax.scatter(vertices[:, 0], vertices[:, 1], vertices[:, 2], marker='o', color='r')
+                # move to camera frame
+                wrist_cam = wrist_mano + cam_t_i                              # (3,)              
 
-            ax.set_xlabel('X Label')
-            ax.set_ylabel('Y Label')
-            ax.set_zlabel('Z Label')
+                # project to image pixels
+                K = np.array([[12500, 0, im_width / 2],
+                            [0, 12500, im_height / 2],
+                            [0, 0, 1]], dtype=np.float32)                
+                (u, v), ok = project_point(K, wrist_cam)
 
-            # save file
-            depth_pc = DepthPointCloud(depth, intrinsic_matrix, camera_pose=np.eye(4), target_mask=None, threshold=10.0)
-            colors = np.zeros(depth_pc.points.shape)
-            colors[:, 1] = 255
-            save_point_cloud_as_ply(depth_pc.points, filename='depth.ply', colors=colors)
-            colors = np.zeros(vertices.shape)
-            colors[:, 0] = 255
-            save_point_cloud_as_ply(vertices, filename='hand.ply', colors=colors)
+                # draw on cam_view_i (alpha mask / RGBA from renderer)
+                cam_vis = (cam_view_i.copy() * 255).astype(np.uint8)          # RGBA uint8, shape (H,W,4)
+                H, W = cam_vis.shape[:2]
 
-            plt.show()
+                if ok and (0 <= u < W) and (0 <= v < H):
+                    cv2.circle(cam_vis, (int(round(u)), int(round(v))), 6, (0, 0, 255, 255), -1)  # red dot
+                    cv2.putText(cam_vis, "wrist", (int(round(u))+8, int(round(v))-8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255, 255), 2)
+
+                # get the hand points (mask from alpha)
+                mask = cam_view_i[:, :, 3] > 0
+
+                # wrist_cam is (X,Y,Z) in meters
+                z = float(wrist_cam[2])
+
+                # Example sensor size guess:
+                # VRTrix puck/strap region: choose r_m ~ 0.03 to 0.05 m (3–5 cm)
+                r_px = radius_px_from_metric(K[0,0], z_m=z, r_m=0.04)
+                mask = mask.astype(np.uint8)
+                cv2.circle(mask, (int(u), int(v)), r_px, 0, thickness=-1)                
+
+                # erode mask
+                kernel = np.ones((5, 5), np.uint8)
+                mask = cv2.erode(mask.astype(np.uint8), kernel)
+
+                # (keep your original inversion behavior)
+                mask = 1 - mask
+
+                # convert depth to point cloud for this hand
+                depth_pc = DepthPointCloud(
+                    depth, intrinsic_matrix,
+                    camera_pose=np.eye(4),
+                    target_mask=mask,
+                    threshold=10.0,
+                    use_kmeans=False
+                )
+
+                if depth_pc.points is None or len(depth_pc.points) < 50:
+                    print(f"[opt] hand {hand_id}: too few depth points ({0 if depth_pc.points is None else len(depth_pc.points)}), skip.")
+                    optimized_cam_t.append(cam_t_i)
+                    continue
+
+                print(f"[opt] hand {hand_id}: depth points = {depth_pc.points.shape}")
+
+                # only select visible vertices
+                vis, _ = visible_vertices_from_render_depth(verts_i, cam_t_i, K, depth_view_i, z_eps=0.008)
+                print(f'for {verts_i.shape[0]} hand vertices, {vis.sum()} visible')
+                if vis.sum() < 50:
+                    vis[:] = True
+                vertices = verts_i[vis]
+
+                # solve new translation (one hand)
+                x0 = np.mean(depth_pc.points, axis=0)
+                res = minimize(
+                    obj_funcion, x0, method='nelder-mead',
+                    args=(vertices, cam_t_i, K, intrinsic_matrix, depth_pc.kd_tree),
+                    options={'xatol': 1e-8, 'disp': True}
+                )
+                translation_new = res.x
+                optimized_cam_t.append(translation_new)
+                print(f"[opt] hand {hand_id}: translation_new = {translation_new}")
+
+                # --- Debug visualization per hand (optional but useful) ---
+                # --- Debug visualization per hand ---
+                fig = plt.figure(figsize=(14, 8))
+
+                # 1) Input image
+                ax = fig.add_subplot(2, 3, 1)
+                ax.imshow(input_img)
+                ax.set_title(f'input (hand {hand_id})')
+                ax.axis('off')
+
+                # 2) Mask visualization (IMPORTANT)
+                ax = fig.add_subplot(2, 3, 2)
+                ax.imshow(mask, cmap='gray')
+                ax.set_title(f'depth mask (hand {hand_id})')
+                ax.axis('off')
+
+                # 3) HaMeR projection
+                ax = fig.add_subplot(2, 3, 3)
+                ax.imshow(input_img)
+                vertices_hamer = vertices + cam_t_i
+                x2d = K @ vertices_hamer.T
+                x2d[0, :] /= x2d[2, :]
+                x2d[1, :] /= x2d[2, :]
+                ax.plot(x2d[0, :], x2d[1, :], linewidth=0.5)
+                ax.set_title(f'proj using HaMeR camera')
+                ax.axis('off')
+
+                # 4) Optimized projection
+                ax = fig.add_subplot(2, 3, 4)
+                ax.imshow(input_img)
+                vertices_opt = vertices + translation_new
+                x2d = intrinsic_matrix @ vertices_opt.T
+                x2d[0, :] /= x2d[2, :]
+                x2d[1, :] /= x2d[2, :]
+                ax.plot(x2d[0, :], x2d[1, :], linewidth=0.5)
+                ax.set_title(f'proj using OAK intrinsics')
+                ax.axis('off')
+
+                # 5) 3D alignment
+                ax = fig.add_subplot(2, 3, 5, projection='3d')
+                ax.scatter(depth_pc.points[:, 0],
+                        depth_pc.points[:, 1],
+                        depth_pc.points[:, 2],
+                        marker='o', s=1)
+                ax.scatter(vertices_opt[:, 0],
+                        vertices_opt[:, 1],
+                        vertices_opt[:, 2],
+                        marker='o', s=1, color='r')
+                ax.set_title('3D depth (gray) vs hand (red)')
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                ax.set_zlabel('Z')
+
+                # wrist
+                ax = fig.add_subplot(2, 3, 6)
+                ax.imshow(cam_vis[:, :, [2,1,0,3]])  # BGRA->RGBA for plt if needed; adjust if colors look off
+                ax.set_title("cam_view_i + wrist projection")
+                ax.axis("off")
+
+                plt.tight_layout()
+                plt.show()
+
+                # save ply per hand
+                depth_pc_full = DepthPointCloud(depth, intrinsic_matrix, camera_pose=np.eye(4), target_mask=None, threshold=10.0)
+                colors = np.zeros(depth_pc_full.points.shape)
+                colors[:, 1] = 255
+                save_point_cloud_as_ply(
+                    depth_pc_full.points,
+                    filename=os.path.join(args.out_folder, f'depth_hand{hand_id}.ply'),
+                    colors=colors
+                )
+
+                colors = np.zeros(vertices_opt.shape)
+                colors[:, 0] = 255
+                save_point_cloud_as_ply(
+                    vertices_opt,
+                    filename=os.path.join(args.out_folder, f'hand_hand{hand_id}.ply'),
+                    colors=colors
+                )
 
 if __name__ == '__main__':
     main()

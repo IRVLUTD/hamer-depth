@@ -18,6 +18,8 @@ from vitpose_model import ViTPoseModel
 import json
 from typing import Dict, Optional
 
+os.environ["PYOPENGL_PLATFORM"] = "win32"
+
 def main():
     parser = argparse.ArgumentParser(description='HaMeR demo code')
     parser.add_argument('--checkpoint', type=str, default=DEFAULT_CHECKPOINT, help='Path to pretrained model checkpoint')

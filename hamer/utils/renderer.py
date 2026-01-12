@@ -400,7 +400,7 @@ class Renderer:
         color = color.astype(np.float32) / 255.0
         renderer.delete()
 
-        return color
+        return color, rend_depth
 
     def add_lighting(self, scene, cam_node, color=np.ones(3), intensity=1.0):
         # from phalp.visualize.py_renderer import get_light_poses
