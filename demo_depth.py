@@ -155,7 +155,7 @@ def obj_funcion(x, vertices, translation, K1, K2, kd_tree):
     error_3d = 100 * np.mean(distances)
 
     # error
-    error_2d = np.square(x1[:2] - x2[:2]).mean()
+    error_2d =  np.square(x1[:2] - x2[:2]).mean()
     print('error 2d', error_2d, 'error_3d', error_3d)
     return error_2d + error_3d
 
