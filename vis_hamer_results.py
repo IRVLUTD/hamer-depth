@@ -16,12 +16,183 @@ Example:
   python vis_hamer_results.py --results out_hamer_recording/results.jsonl --use_opt --show_vertices
 """
 
+from typing import Optional, Tuple, Dict, Any
 from pathlib import Path
 import argparse
 import json
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
+from scipy.spatial.transform import Rotation
+from manotorch.manolayer import ManoLayer, MANOOutput
+
+import pyvista as pv
+
+def plot_two_point_sets(
+    V_hamer: np.ndarray,
+    V_recon: np.ndarray,
+    *,
+    point_size: float = 4.0,
+    title: str = "HaMeR pred_vertices (red) vs reconstructed MANO (blue)",
+):
+    """
+    V_hamer: (N,3) from h["pred_vertices"]
+    V_recon: (N,3) from ManoLayer reconstruction
+    """
+    assert V_hamer.shape == V_recon.shape
+
+    pl = pv.Plotter(title=title)
+    pl.set_background("white")
+
+    # HaMeR vertices
+    pl.add_points(
+        V_hamer,
+        color="red",
+        point_size=point_size,
+        render_points_as_spheres=True,
+        label="HaMeR pred_vertices",
+    )
+
+    # Reconstructed MANO vertices
+    pl.add_points(
+        V_recon,
+        color="blue",
+        point_size=point_size,
+        render_points_as_spheres=True,
+        label="Reconstructed MANO",
+    )
+
+    axes = pv.Axes(show_actor=True)
+    pl.add_actor(axes.actor)        
+
+    pl.add_legend()
+    pl.add_camera_orientation_widget()
+    pl.show()
+
+
+def make_mano_layers(device: torch.device):
+    mano_left = ManoLayer(
+        rot_mode="axisang",
+        use_pca=False,
+        side="left",
+        center_idx=0,
+        mano_assets_root="assets/mano",
+        flat_hand_mean=True,
+    ).to(device)
+
+    mano_right = ManoLayer(
+        rot_mode="axisang",
+        use_pca=False,
+        side="right",
+        center_idx=0,
+        mano_assets_root="assets/mano",
+        flat_hand_mean=True,
+    ).to(device)
+
+    return mano_left, mano_right
+
+
+def mano_rotmats16_to_axisang48(mano_pose_rotmats: np.ndarray) -> np.ndarray:
+    """
+    mano_pose_rotmats: (16,3,3) or (B,16,3,3)
+    returns axisang: (48,) or (B,48)
+    """
+    Rm = np.asarray(mano_pose_rotmats, dtype=np.float32)
+    if Rm.ndim == 3:
+        Rm = Rm[None, ...]  # (1,16,3,3)
+    assert Rm.shape[1:] == (16, 3, 3)
+
+    B = Rm.shape[0]
+    aa = np.zeros((B, 16, 3), dtype=np.float32)
+    for b in range(B):
+        aa[b] = Rotation.from_matrix(Rm[b]).as_rotvec().astype(np.float32)  # (16,3)
+
+    aa48 = aa.reshape(B, 48)
+    return aa48[0] if mano_pose_rotmats.ndim == 3 else aa48
+
+
+def hamer_hand_to_mano_out(
+    h: Dict[str, Any],
+    *,
+    mano_right: ManoLayer,
+    device: torch.device,
+    mirror_left_x: bool = True,
+) -> Tuple[MANOOutput, Dict[str, Any]]:
+    """
+    Convert one HaMeR hand record `h` (from rec["hands"]) to manotorch MANOOutput.
+
+    Assumptions (matches your current export):
+      - h["mano_pose"] is (16,3,3) rotation matrices in MANO joint order (root + 15).
+      - h["mano_shape"] is (10,) or (1,10) betas.
+      - h["is_right"] exists: 1 for right, 0 for left.
+      - HaMeR uses right-hand MANO model; left is handled by mirroring X if desired.
+
+    Returns:
+      mano_out: MANOOutput from manotorch
+      info: dict with useful extras:
+        - lr: "R" or "L"
+        - did_mirror: bool
+        - V_local: (778,3) vertices in MANO root frame (after optional mirroring)
+        - V_wrist_canon: (778,3) vertices in wrist-canonical frame (after optional mirroring)
+        - R_wrist, t_wrist (numpy)
+    """
+    mano_pose = h.get("mano_pose", None)
+    mano_shape = h.get("mano_shape", None)
+    if mano_pose is None or mano_shape is None:
+        raise ValueError("HaMeR hand record missing mano_pose or mano_shape")
+
+    mano_pose = np.asarray(mano_pose, dtype=np.float32)
+    mano_shape = np.asarray(mano_shape, dtype=np.float32)
+
+    lr = "R" if int(h.get("is_right", 0)) == 1 else "L"
+
+    # Convert pose rotmats -> axis-angle 48
+    pose_aa48 = mano_rotmats16_to_axisang48(mano_pose)  # (48,)
+    pose_t = torch.from_numpy(pose_aa48).float().view(1, 48).to(device)
+
+    # Shape (1,10)
+    shape_t = torch.from_numpy(mano_shape).float()
+    if shape_t.ndim == 1:
+        shape_t = shape_t.view(1, -1)
+    shape_t = shape_t[:, :10].to(device)
+
+    # HaMeR: always decode with RIGHT-hand model
+    mano_out: MANOOutput = mano_right(pose_t, shape_t)
+
+    # Extract vertices and wrist FK
+    V = mano_out.verts[0]  # (778,3) torch
+    T_abs = mano_out.transforms_abs[0]  # (16,4,4) torch
+    R_wrist_t = T_abs[0, :3, :3]
+    t_wrist_t = T_abs[0, :3, 3]
+
+    did_mirror = False
+
+    # Optional: mirror left hand in X to match your convention
+    if lr == "L" and mirror_left_x:
+        did_mirror = True
+
+        # Mirror vertices in MANO root frame
+        V = V.clone()
+        V[:, 0] *= -1.0
+
+        # Mirror wrist transform consistently: x' = -x  ->  M = diag([-1,1,1])
+        M = torch.diag(torch.tensor([-1.0, 1.0, 1.0], device=device))
+        R_wrist_t = M @ R_wrist_t @ M  # conjugation
+        t_wrist_t = (M @ t_wrist_t)
+
+    # Wrist-canonicalize: express verts in wrist frame
+    V_wrist_canon_t = (V - t_wrist_t[None, :]) @ R_wrist_t  # (778,3)
+
+    info = {
+        "lr": lr,
+        "did_mirror": did_mirror,
+        "V_local": V.detach().cpu().numpy().astype(np.float64),
+        "V_wrist_canon": V_wrist_canon_t.detach().cpu().numpy().astype(np.float64),
+        "R_wrist": R_wrist_t.detach().cpu().numpy().astype(np.float64),
+        "t_wrist": t_wrist_t.detach().cpu().numpy().astype(np.float64),
+    }
+    return mano_out, info
 
 
 def iter_results(path: Path):
@@ -95,6 +266,7 @@ def load_bgr(path: Path):
     if img is None:
         raise FileNotFoundError(f"Could not read image: {path}")
     return img
+    
 
 
 def main():
@@ -111,11 +283,22 @@ def main():
                     help="Extra margin added to projected bbox")
     ap.add_argument("--pause", type=float, default=0.0,
                     help="If > 0, auto-advance after this many seconds; otherwise wait for window close")
+    ap.add_argument("--device", choices=["cpu", "cuda"], default="cuda")    
     # NOTE: we intentionally do NOT draw saved detection bboxes.
     args = ap.parse_args()
 
     results_path = Path(args.results)
     data_root = Path(args.data_root) if args.data_root else None
+
+    # device for MANO
+    if args.device == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
+    print("[mano] device:", device)    
+
+    # ---- MANO layers (also used to get J_regressor for wrist-centering)
+    mano_left, mano_right = make_mano_layers(device)    
 
     for i, rec in enumerate(iter_results(results_path)):
         rgb_path = Path(rec["rgb_path"])
@@ -143,15 +326,19 @@ def main():
             if verts is None:
                 continue
             verts = np.asarray(verts, dtype=np.float32)
+            print(verts.shape) 
 
-            mano_pose = h.get("mano_pose", None)
-            if mano_pose is not None:
-                mano_pose = np.asarray(mano_pose, dtype=np.float32)
-                print('mano pose with length', mano_pose.shape)
-            mano_shape = h.get("mano_shape", None)
-            if mano_shape is not None:
-                mano_shape = np.asarray(mano_shape, dtype=np.float32)
-                print('mano shape with length', mano_shape.shape)
+            # For hamer, always use right model (your convention)
+            mano_out, info = hamer_hand_to_mano_out(h, mano_right=mano_right, device=device, mirror_left_x=True)
+            V_local = info["V_local"]                 # (778,3)
+            V_canon = info["V_wrist_canon"]          # (778,3)
+       
+
+            V_hamer = np.asarray(h["pred_vertices"], dtype=np.float64)
+            K3d = np.asarray(h["pred_keypoints_3d"], dtype=np.float32)    # (21,3) usually
+            wrist = K3d[0]                                                # (3,)
+            V_wrist = V_hamer - wrist[None, :]                 
+            plot_two_point_sets(V_wrist, V_canon, point_size=3.0)
 
             # Subsample for speed (bbox computed on subsample is still usually fine;
             # set --max_vertices 0 if you want exact bbox)
