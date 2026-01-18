@@ -236,6 +236,9 @@ def main():
     parser.add_argument("--side_view", action="store_true", default=False)
     parser.add_argument("--debug", action="store_true", default=False)
 
+    parser.add_argument("--max-pairs", type=int, default=0,
+                    help="Maximum number of aligned pairs to generate. 0 = no limit.")    
+
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--rescale_factor", type=float, default=2.0)
     parser.add_argument("--body_detector", type=str, default="vitdet", choices=["vitdet", "regnety"])
@@ -270,6 +273,10 @@ def main():
     if len(pairs) == 0:
         print("[error] no RGB-depth pairs found.")
         return
+    
+    if args.max_pairs > 0:
+        pairs = pairs[:args.max_pairs]
+        print(f"[info] selecting max_pairs={args.max_pairs}.")
 
     calib_path = data_dir / "calibration.json"
     first_depth = cv2.imread(str(pairs[0][1]), cv2.IMREAD_UNCHANGED)
