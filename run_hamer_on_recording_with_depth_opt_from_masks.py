@@ -154,7 +154,19 @@ def load_hand_mask(mask_path: Path) -> np.ndarray:
     return m
 
 
-def bbox_from_label(mask: np.ndarray, label: int, min_area: int = 50, pad: int = 8) -> Optional[List[float]]:
+def bbox_from_label(
+    mask: np.ndarray,
+    label: int,
+    min_area: int = 50,
+    pad_ratio: float = 0.15,   # 15% padding
+) -> Optional[List[float]]:
+    """
+    Compute tight bbox for given label and expand it by a percentage
+    of its width/height.
+
+    pad_ratio = 0.15  -> 15% on each side
+    """
+
     ys, xs = np.where(mask == label)
     if xs.size == 0:
         return None
@@ -162,15 +174,22 @@ def bbox_from_label(mask: np.ndarray, label: int, min_area: int = 50, pad: int =
     x1, x2 = int(xs.min()), int(xs.max())
     y1, y2 = int(ys.min()), int(ys.max())
 
-    area = (x2 - x1 + 1) * (y2 - y1 + 1)
+    w = x2 - x1 + 1
+    h = y2 - y1 + 1
+    area = w * h
     if area < int(min_area):
         return None
 
+    # percentage padding
+    pad_x = int(w * pad_ratio)
+    pad_y = int(h * pad_ratio)
+
     H, W = mask.shape[:2]
-    x1 = max(0, x1 - pad)
-    y1 = max(0, y1 - pad)
-    x2 = min(W - 1, x2 + pad)
-    y2 = min(H - 1, y2 + pad)
+
+    x1 = max(0, x1 - pad_x)
+    y1 = max(0, y1 - pad_y)
+    x2 = min(W - 1, x2 + pad_x)
+    y2 = min(H - 1, y2 + pad_y)
 
     return [float(x1), float(y1), float(x2), float(y2)]
 
@@ -306,7 +325,8 @@ def main():
     parser.add_argument("--mask_left_label", type=int, default=1)
     parser.add_argument("--mask_right_label", type=int, default=2)
     parser.add_argument("--mask_min_area", type=int, default=50)
-    parser.add_argument("--mask_pad", type=int, default=12)
+    parser.add_argument("--mask_pad_ratio", type=float, default=0.15,
+                        help="Padding as percentage of bbox size (e.g. 0.15 = 15%)")
 
     parser.add_argument("--out_folder", type=str, default="out_hamer_recording_from_masks")
     parser.add_argument("--save_renders", action="store_true", default=False)
@@ -410,7 +430,7 @@ def main():
 
             bbox_l = bbox_from_label(
                 hand_mask, label=int(args.mask_left_label),
-                min_area=int(args.mask_min_area), pad=int(args.mask_pad)
+                min_area=int(args.mask_min_area), pad_ratio=float(args.mask_pad_ratio)
             )
             if bbox_l is not None:
                 hand_bboxes.append(bbox_l)
@@ -418,7 +438,7 @@ def main():
 
             bbox_r = bbox_from_label(
                 hand_mask, label=int(args.mask_right_label),
-                min_area=int(args.mask_min_area), pad=int(args.mask_pad)
+                min_area=int(args.mask_min_area), pad_ratio=float(args.mask_pad_ratio)
             )
             if bbox_r is not None:
                 hand_bboxes.append(bbox_r)
