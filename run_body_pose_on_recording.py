@@ -121,7 +121,7 @@ def main():
     data_dir = Path(args.data_dir)
     export_pairs_dir = data_dir / "export_pairs"
 
-    out_dir = Path(args.out_folder)
+    out_dir = export_pairs_dir / Path(args.out_folder)
     out_dir.mkdir(parents=True, exist_ok=True)
     render_dir = out_dir / "renders"
     render_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +143,7 @@ def main():
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for idx, rgb_path in enumerate(rgb_paths):
             frame_id = rgb_path.name
+            print(frame_id)
             if frame_id.startswith(args.rgb_prefix):
                 frame_id = frame_id[len(args.rgb_prefix):]
             frame_id = Path(frame_id).stem
